@@ -6138,7 +6138,7 @@ void StorageReplicatedMergeTree::clearOldPartsAndRemoveFromZK()
             if (!rollback_parts.empty())
                 rollbackDeletingParts(rollback_parts);
         }
-        else  /// all parts was successfuly removed
+        else  /// all parts was successfully removed
         {
             finally_remove_parts = parts_to_delete;
         }
