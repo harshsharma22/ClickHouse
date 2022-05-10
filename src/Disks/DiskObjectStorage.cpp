@@ -13,6 +13,7 @@
 #include <Common/filesystemHelpers.h>
 #include <Disks/IO/ThreadPoolRemoteFSReader.h>
 #include <Common/FileCache.h>
+#include <Common/logger_useful.h>
 
 
 namespace DB
@@ -671,6 +672,323 @@ DiskObjectStorageReservation::~DiskObjectStorageReservation()
     }
 }
 
+static String revisionToString(UInt64 revision)
+{
+    return std::bitset<64>(revision).to_string();
+}
+
+void DiskObjectStorageMetadataHelper::createFileOperationObject(const String & operation_name, UInt64 revision, const ObjectAttributes & metadata) const
+{
+    const String path = disk->remote_fs_root_path + "operations/r" + revisionToString(revision) + "-" + operation_name;
+    auto buf = disk->object_storage->writeObject(path, metadata);
+    buf->write('0');
+    buf->finalize();
+}
+
+void DiskObjectStorageMetadataHelper::findLastRevision()
+{
+    /// Construct revision number from high to low bits.
+    String revision;
+    revision.reserve(64);
+    for (int bit = 0; bit < 64; ++bit)
+    {
+        auto revision_prefix = revision + "1";
+
+        LOG_TRACE(disk->log, "Check object exists with revision prefix {}", revision_prefix);
+
+        /// Check file or operation with such revision prefix exists.
+        if (disk->object_storage->exists(disk->remote_fs_root_path + "r" + revision_prefix)
+            || disk->object_storage->exists(disk->remote_fs_root_path + "operations/r" + revision_prefix))
+            revision += "1";
+        else
+            revision += "0";
+    }
+    revision_counter = static_cast<UInt64>(std::bitset<64>(revision).to_ullong());
+    LOG_INFO(disk->log, "Found last revision number {} for disk {}", revision_counter, disk->name);
+}
+
+int DiskObjectStorageMetadataHelper::readSchemaVersion(const String & source_path) const
+{
+    const std::string path = source_path + SCHEMA_VERSION_OBJECT;
+    int version = 0;
+    if (!disk->object_storage->exists(path))
+        return version;
+
+    auto buf = disk->object_storage->readObject(path);
+    readIntText(version, *buf);
+
+    return version;
+}
+
+void DiskObjectStorageMetadataHelper::saveSchemaVersion(const int & version) const
+{
+    auto path = disk->remote_fs_root_path + SCHEMA_VERSION_OBJECT;
+
+    auto buf = disk->object_storage->writeObject(path);
+    writeIntText(version, *buf);
+    buf->finalize();
+
+}
+
+void DiskObjectStorageMetadataHelper::updateObjectMetadata(const String & key, const ObjectAttributes & metadata) const
+{
+    disk->object_storage->copyObject(key, key, metadata);
+}
+
+void DiskObjectStorageMetadataHelper::migrateFileToRestorableSchema(const String & path) const
+{
+    LOG_TRACE(disk->log, "Migrate file {} to restorable schema", disk->metadata_disk->getPath() + path);
+
+    auto meta = disk->readMetadata(path);
+
+    for (const auto & [key, _] : meta.remote_fs_objects)
+    {
+        ObjectAttributes metadata {
+            {"path", path}
+        };
+        updateObjectMetadata(disk->remote_fs_root_path + key, metadata);
+    }
+}
+void DiskObjectStorageMetadataHelper::migrateToRestorableSchemaRecursive(const String & path, Futures & results)
+{
+    checkStackSize(); /// This is needed to prevent stack overflow in case of cyclic symlinks.
+
+    LOG_TRACE(disk->log, "Migrate directory {} to restorable schema", disk->metadata_disk->getPath() + path);
+
+    bool dir_contains_only_files = true;
+    for (auto it = disk->iterateDirectory(path); it->isValid(); it->next())
+        if (disk->isDirectory(it->path()))
+        {
+            dir_contains_only_files = false;
+            break;
+        }
+
+    /// The whole directory can be migrated asynchronously.
+    if (dir_contains_only_files)
+    {
+        auto result = disk->getExecutor().execute([this, path]
+             {
+                 for (auto it = disk->iterateDirectory(path); it->isValid(); it->next())
+                     migrateFileToRestorableSchema(it->path());
+             });
+
+        results.push_back(std::move(result));
+    }
+    else
+    {
+        for (auto it = disk->iterateDirectory(path); it->isValid(); it->next())
+            if (!disk->isDirectory(it->path()))
+            {
+                auto source_path = it->path();
+                auto result = disk->getExecutor().execute([this, source_path]
+                    {
+                        migrateFileToRestorableSchema(source_path);
+                    });
+
+                results.push_back(std::move(result));
+            }
+            else
+                migrateToRestorableSchemaRecursive(it->path(), results);
+    }
+
+}
+
+void DiskObjectStorageMetadataHelper::migrateToRestorableSchema()
+{
+    try
+    {
+        LOG_INFO(disk->log, "Start migration to restorable schema for disk {}", disk->name);
+
+        Futures results;
+
+        for (const auto & root : data_roots)
+            if (disk->exists(root))
+                migrateToRestorableSchemaRecursive(root + '/', results);
+
+        for (auto & result : results)
+            result.wait();
+        for (auto & result : results)
+            result.get();
+
+        saveSchemaVersion(RESTORABLE_SCHEMA_VERSION);
+    }
+    catch (const Exception &)
+    {
+        tryLogCurrentException(disk->log, fmt::format("Failed to migrate to restorable schema for disk {}", disk->name));
+
+        throw;
+    }
+}
+
+void DiskObjectStorageMetadataHelper::restore()
+{
+    if (!disk->exists(RESTORE_FILE_NAME))
+        return;
+
+    try
+    {
+        RestoreInformation information;
+        information.source_bucket = disk->bucket;
+        information.source_path = disk->remote_fs_root_path;
+
+        readRestoreInformation(information);
+        if (information.revision == 0)
+            information.revision = LATEST_REVISION;
+        if (!information.source_path.ends_with('/'))
+            information.source_path += '/';
+
+        if (information.source_bucket == disk->bucket)
+        {
+            /// In this case we need to additionally cleanup S3 from objects with later revision.
+            /// Will be simply just restore to different path.
+            if (information.source_path == disk->remote_fs_root_path && information.revision != LATEST_REVISION)
+                throw Exception("Restoring to the same bucket and path is allowed if revision is latest (0)", ErrorCodes::BAD_ARGUMENTS);
+
+            /// This case complicates S3 cleanup in case of unsuccessful restore.
+            if (information.source_path != remote_fs_root_path && disk->remote_fs_root_path.starts_with(information.source_path))
+                throw Exception("Restoring to the same bucket is allowed only if source path is not a sub-path of configured path in S3 disk", ErrorCodes::BAD_ARGUMENTS);
+        }
+
+        LOG_INFO(disk->log, "Starting to restore disk {}. Revision: {}, Source bucket: {}, Source path: {}",
+                 name, information.revision, information.source_bucket, information.source_path);
+
+        if (readSchemaVersion(information.source_bucket, information.source_path) < RESTORABLE_SCHEMA_VERSION)
+            throw Exception("Source bucket doesn't have restorable schema.", ErrorCodes::BAD_ARGUMENTS);
+
+        LOG_INFO(disk->log, "Removing old metadata...");
+
+        bool cleanup_s3 = information.source_bucket != disk->bucket || information.source_path != disk->remote_fs_root_path;
+        for (const auto & root : data_roots)
+            if (disk->exists(root))
+                disk->removeSharedRecursive(root + '/', !cleanup_s3, {});
+
+        restoreFiles(information);
+        restoreFileOperations(information);
+
+        disk->metadata_disk->removeFile(RESTORE_FILE_NAME);
+
+        saveSchemaVersion(RESTORABLE_SCHEMA_VERSION);
+
+        LOG_INFO(disk->log, "Restore disk {} finished", disk->name);
+    }
+    catch (const Exception &)
+    {
+        tryLogCurrentException(disk->log, fmt::format("Failed to restore disk {}", disk->name));
+
+        throw;
+    }
+}
+
+void DiskObjectStorageMetadataHelper::readRestoreInformation(RestoreInformation & restore_information)
+{
+    const ReadSettings read_settings;
+    auto buffer = disk->metadata_disk->readFile(RESTORE_FILE_NAME, read_settings, 512);
+    buffer->next();
+
+    try
+    {
+        std::map<String, String> properties;
+
+        while (buffer->hasPendingData())
+        {
+            String property;
+            readText(property, *buffer);
+            assertChar('\n', *buffer);
+
+            auto pos = property.find('=');
+            if (pos == std::string::npos || pos == 0 || pos == property.length())
+                throw Exception(fmt::format("Invalid property {} in restore file", property), ErrorCodes::UNKNOWN_FORMAT);
+
+            auto key = property.substr(0, pos);
+            auto value = property.substr(pos + 1);
+
+            auto it = properties.find(key);
+            if (it != properties.end())
+                throw Exception(fmt::format("Property key duplication {} in restore file", key), ErrorCodes::UNKNOWN_FORMAT);
+
+            properties[key] = value;
+        }
+
+        for (const auto & [key, value] : properties)
+        {
+            ReadBufferFromString value_buffer (value);
+
+            if (key == "revision")
+                readIntText(restore_information.revision, value_buffer);
+            else if (key == "source_bucket")
+                readText(restore_information.source_bucket, value_buffer);
+            else if (key == "source_path")
+                readText(restore_information.source_path, value_buffer);
+            else if (key == "detached")
+                readBoolTextWord(restore_information.detached, value_buffer);
+            else
+                throw Exception(fmt::format("Unknown key {} in restore file", key), ErrorCodes::UNKNOWN_FORMAT);
+        }
+    }
+    catch (const Exception &)
+    {
+        tryLogCurrentException(disk->log, "Failed to read restore information");
+        throw;
+    }
+}
+
+void DiskObjectStorageMetadataHelper::restoreFiles(const RestoreInformation & restore_information)
+{
+    LOG_INFO(log, "Starting restore files for disk {}", name);
+
+    std::vector<std::future<void>> results;
+    auto restore_files = [this, &restore_information, &results](auto list_result)
+    {
+        std::vector<String> keys;
+        for (const auto & row : list_result.GetContents())
+        {
+            const String & key = row.GetKey();
+
+            /// Skip file operations objects. They will be processed separately.
+            if (key.find("/operations/") != String::npos)
+                continue;
+
+            const auto [revision, _] = extractRevisionAndOperationFromKey(key);
+            /// Filter early if it's possible to get revision from key.
+            if (revision > restore_information.revision)
+                continue;
+
+            keys.push_back(key);
+        }
+
+        if (!keys.empty())
+        {
+            auto result = getExecutor().execute([this, &restore_information, keys]()
+            {
+                processRestoreFiles(restore_information.source_bucket, restore_information.source_path, keys);
+            });
+
+            results.push_back(std::move(result));
+        }
+
+        return true;
+    };
+
+    /// Execute.
+    listObjects(restore_information.source_bucket, restore_information.source_path, restore_files);
+
+    for (auto & result : results)
+        result.wait();
+    for (auto & result : results)
+        result.get();
+
+    LOG_INFO(log, "Files are restored for disk {}", name);
+
+}
+
+void DiskObjectStorageMetadataHelper::processRestoreFiles(const String & source_bucket, const String & source_path, std::vector<String> keys)
+{
+
+}
+void DiskObjectStorageMetadataHelper::restoreFileOperations(const RestoreInformation & restore_information)
+{
+
+}
 
 
 }

@@ -7,6 +7,7 @@
 #include <Disks/IO/WriteIndirectBufferFromRemoteFS.h>
 #include <Disks/IO/ThreadPoolRemoteFSReader.h>
 #include <IO/WriteBufferFromS3.h>
+#include <IO/ReadBufferFromS3.h>
 #include <IO/SeekAvoidingReadBuffer.h>
 #include <Interpreters/threadPoolCallbackRunner.h>
 #include <Disks/S3/diskSettings.h>
@@ -118,6 +119,17 @@ std::unique_ptr<ReadBufferFromFileBase> S3ObjectStorage::readObjects( /// NOLINT
        return std::make_unique<SeekAvoidingReadBuffer>(std::move(buf), settings_ptr->min_bytes_for_seek);
    }
 }
+
+std::unique_ptr<SeekableReadBuffer> S3ObjectStorage::readObject( /// NOLINT
+    const std::string & path,
+    const ReadSettings & read_settings,
+    std::optional<size_t>,
+    std::optional<size_t>) const
+{
+   auto settings_ptr = s3_settings.get();
+   return std::make_unique<ReadBufferFromS3>(client.get(), bucket, path, version_id, settings_ptr->s3_settings.max_single_read_retries, read_settings);
+}
+
 
 std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject(
     const std::string & path,

@@ -64,6 +64,12 @@ public:
 
     virtual ObjectMetadata getObjectMetadata(const std::string & path) const = 0;
 
+    virtual std::unique_ptr<SeekableReadBuffer> readObject( /// NOLINT
+        const std::string & path,
+        const ReadSettings & read_settings = ReadSettings{},
+        std::optional<size_t> read_hint = {},
+        std::optional<size_t> file_size = {}) const = 0;
+
     virtual std::unique_ptr<ReadBufferFromFileBase> readObjects( /// NOLINT
         const std::string & common_path_prefix,
         const BlobsPathToSize & blobs_to_read,

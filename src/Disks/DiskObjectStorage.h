@@ -2,6 +2,7 @@
 
 #include <Disks/IDisk.h>
 #include <Disks/IObjectStorage.h>
+#include <re2/re2.h>
 
 namespace CurrentMetrics
 {
@@ -282,17 +283,13 @@ public:
 
     using Futures = std::vector<std::future<void>>;
 
-    void createFileOperationObject(const String & operation_name, UInt64 revision, const ObjectAttributes & metadata);
-    /// Converts revision to binary string with leading zeroes (64 bit).
-    static String revisionToString(UInt64 revision);
-
-    bool checkObjectExists(const String & source_bucket, const String & prefix) const;
+    void createFileOperationObject(const String & operation_name, UInt64 revision, const ObjectAttributes & metadata) const;
     void findLastRevision();
 
-    int readSchemaVersion(const String & source_bucket, const String & source_path);
-    void saveSchemaVersion(const int & version);
-    void updateObjectMetadata(const String & key, const ObjectMetadata & metadata);
-    void migrateFileToRestorableSchema(const String & path);
+    int readSchemaVersion(const String & source_path) const;
+    void saveSchemaVersion(const int & version) const;
+    void updateObjectMetadata(const String & key, const ObjectAttributes & metadata) const;
+    void migrateFileToRestorableSchema(const String & path) const;
     void migrateToRestorableSchemaRecursive(const String & path, Futures & results);
     void migrateToRestorableSchema();
 
@@ -323,9 +320,9 @@ public:
     /// Directories with data.
     const std::vector<String> data_roots {"data", "store"};
 
-    ReadSettings read_settings;
-
     DiskObjectStorage * disk;
+
+    ReadSettings read_settings;
 };
 
 }
